@@ -63,6 +63,10 @@ const favoritePageCache = new Map()
 const favoritePageRequests = new Map()
 const favoriteFolderVersions = new Map()
 const favoriteLibraryRequests = new Map()
+const favoriteVideoStates = new Map()
+const favoriteStateRequests = new Map()
+const favoriteWriteRequests = new Map()
+let favoriteMutationVersion = 0
 const loginCheckRequests = new Map()
 let cookieRefreshCheckedAt = 0
 // Login state and WBI keys are cached so the getPlaybackUrl hot path does not
@@ -123,8 +127,8 @@ export async function activate(context) {
     fetchRecentSongs: async () => [],
     followArtist: async () => undefined,
     followUser: async () => undefined,
-    likeTrack: async () => undefined,
-    isTrackLiked: async () => false,
+    likeTrack,
+    isTrackLiked,
     // Playlist editing has no Bilibili counterpart; fail these explicit user
     // actions with a clear message rather than pretending they succeeded.
     createPlaylist: async () => {
@@ -158,6 +162,10 @@ export async function deactivate() {
   favoritePageRequests.clear()
   favoriteFolderVersions.clear()
   favoriteLibraryRequests.clear()
+  favoriteVideoStates.clear()
+  favoriteStateRequests.clear()
+  favoriteWriteRequests.clear()
+  favoriteMutationVersion++
   loginCheckRequests.clear()
   cookieRefreshCheckedAt = 0
   loginStateCache = null
@@ -248,6 +256,10 @@ async function logout() {
   favoritePageRequests.clear()
   favoriteFolderVersions.clear()
   favoriteLibraryRequests.clear()
+  favoriteVideoStates.clear()
+  favoriteStateRequests.clear()
+  favoriteWriteRequests.clear()
+  favoriteMutationVersion++
   loginCheckRequests.clear()
   cookieRefreshCheckedAt = 0
   loginStateCache = null
@@ -344,6 +356,7 @@ async function fetchPlaylistTracksPage(playlistId, offset = 0, limit = PAGE_SIZE
   const auth = await readAuth()
   if (!auth?.cookie) throw new Error('请先登录 Bilibili')
   const context = requireContext()
+  const mutationVersion = favoriteMutationVersion
   const session = favoriteSessionKey(auth.cookie)
   const folderKey = JSON.stringify([session, String(playlistId)])
   const cacheKey = JSON.stringify([folderKey, offset, size])
@@ -383,8 +396,10 @@ async function fetchPlaylistTracksPage(playlistId, offset = 0, limit = PAGE_SIZE
       }
       if (
         pluginContext === context && favoriteSessionKey((await readAuth())?.cookie) === session &&
-        (favoriteFolderVersions.get(folderKey) || 0) === pageVersion
+        (favoriteFolderVersions.get(folderKey) || 0) === pageVersion &&
+        favoriteMutationVersion === mutationVersion
       ) {
+        rememberFavoriteVideos(medias, session)
         favoritePageCache.delete(cacheKey)
         favoritePageCache.set(cacheKey, { folderKey, page, expiresAt: Date.now() + FAVORITE_CACHE_TTL_MS })
         while (favoritePageCache.size > MAX_FAVORITE_PAGE_CACHE_ENTRIES) {
@@ -427,6 +442,7 @@ async function fetchPlaylistTracks(playlistId, force = false) {
   const auth = await readAuth()
   if (!auth?.cookie) throw new Error('请先登录 Bilibili')
   const context = requireContext()
+  const mutationVersion = favoriteMutationVersion
   const session = favoriteSessionKey(auth.cookie)
   const cacheKey = JSON.stringify([session, String(playlistId)])
   const cached = favoriteTrackCache.get(cacheKey)
@@ -434,14 +450,16 @@ async function fetchPlaylistTracks(playlistId, force = false) {
   return shareRequest(favoriteTrackRequests, cacheKey, async () => {
     try {
       const { cookie } = await requireLoggedIn()
-      const tracks = await loadFavoriteTracks(playlistId, cookie, deadline)
-      if (pluginContext === context && favoriteSessionKey((await readAuth())?.cookie) === session) {
+      const { tracks, medias } = await loadFavoriteTracks(playlistId, cookie, deadline)
+      if (pluginContext === context && favoriteSessionKey((await readAuth())?.cookie) === session &&
+        favoriteMutationVersion === mutationVersion) {
+        rememberFavoriteVideos(medias, session)
         favoriteTrackCache.set(cacheKey, { tracks, expiresAt: Date.now() + FAVORITE_CACHE_TTL_MS })
       }
       return tracks
     } catch (error) {
       if (
-        error?.retryable && cached && pluginContext === context &&
+        error?.retryable && cached && pluginContext === context && favoriteMutationVersion === mutationVersion &&
         Date.now() < cached.expiresAt + FAVORITE_CACHE_STALE_TTL_MS &&
         favoriteSessionKey((await readAuth())?.cookie) === session
       ) {
@@ -484,7 +502,125 @@ async function loadFavoriteTracks(playlistId, cookie, deadline) {
   const tracks = await mapWithConcurrency(entries, VIDEO_VIEW_CONCURRENCY, ({ media, albumName }) =>
     mapMediaToTracks(media, albumName, cookie, deadline)
   )
-  return tracks.flat().filter(Boolean)
+  return { tracks: tracks.flat().filter(Boolean), medias: entries.map(({ media }) => media) }
+}
+
+function favoriteVideoId(trackId) {
+  const bvid = String(trackId || '').replace(/^bili:/, '').split(':')[0]
+  return /^BV[a-zA-Z0-9]+$/.test(bvid) ? bvid : null
+}
+
+function favoriteVideoKey(session, bvid) {
+  return JSON.stringify([session, bvid])
+}
+
+function rememberFavoriteVideos(medias, session) {
+  for (const media of medias) {
+    const bvid = favoriteVideoId(media.bvid || media.bv_id)
+    if (!bvid || media.type !== 2 || media.attr !== 0) continue
+    const aid = Number(media.id || media.aid)
+    favoriteVideoStates.set(favoriteVideoKey(session, bvid), {
+      aid: Number.isSafeInteger(aid) && aid > 0 ? aid : null,
+      liked: true,
+      expiresAt: Date.now() + FAVORITE_CACHE_TTL_MS
+    })
+  }
+}
+
+async function fetchVideoFavoriteFolders(bvid, cookie, profile, deadline) {
+  const session = favoriteSessionKey(cookie)
+  let aid = favoriteVideoStates.get(favoriteVideoKey(session, bvid))?.aid
+  if (!aid) aid = Number((await getVideoView(bvid, cookie, { deadline })).aid)
+  if (!Number.isSafeInteger(aid) || aid <= 0) throw new Error('Bilibili 视频 ID 无效，无法修改收藏')
+  const url = new URL('https://api.bilibili.com/x/v3/fav/folder/created/list-all')
+  url.searchParams.set('up_mid', String(profile.userId))
+  url.searchParams.set('type', '2')
+  url.searchParams.set('rid', String(aid))
+  const response = await biliJson(url, {
+    cookie, deadline, retries: 1,
+    validate: (response) => {
+      if (!response.data || (response.data.list != null && !Array.isArray(response.data.list))) {
+        throw new Error('Bilibili 收藏状态数据不完整，请稍后重试')
+      }
+    }
+  })
+  const folders = response.data.list || []
+  if (folders.some((folder) => !Number.isSafeInteger(Number(folder.id)) || Number(folder.id) <= 0 ||
+    ![0, 1].includes(Number(folder.fav_state))) || (!folders.length && Number(response.data.count) > 0)) {
+    throw new Error('Bilibili 收藏状态数据不完整，请稍后重试')
+  }
+  return { aid, folders }
+}
+
+async function isTrackLiked(trackId) {
+  const bvid = favoriteVideoId(trackId)
+  const auth = await readAuth()
+  if (!bvid || !auth?.cookie) return false
+  const session = favoriteSessionKey(auth.cookie)
+  const key = favoriteVideoKey(session, bvid)
+  const cached = favoriteVideoStates.get(key)
+  if (isCacheEntryFresh(cached)) return cached.liked
+  return shareRequest(favoriteStateRequests, key, async () => {
+    const context = requireContext()
+    const version = favoriteMutationVersion
+    const { cookie, profile } = await requireLoggedIn()
+    const { aid, folders } = await fetchVideoFavoriteFolders(bvid, cookie, profile, Date.now() + PLAYBACK_LOAD_TIMEOUT_MS)
+    const liked = folders.some((folder) => Number(folder.fav_state) === 1)
+    if (pluginContext === context && favoriteSessionKey((await readAuth())?.cookie) === session &&
+      version === favoriteMutationVersion) {
+      favoriteVideoStates.set(key, { aid, liked, expiresAt: Date.now() + FAVORITE_CACHE_TTL_MS })
+    }
+    return liked
+  })
+}
+
+async function likeTrack(trackId, like) {
+  const bvid = favoriteVideoId(trackId)
+  if (!bvid) throw new Error('Bilibili 视频 ID 无效，无法修改收藏')
+  const auth = await readAuth()
+  if (!auth?.cookie) throw new Error('请先登录 Bilibili')
+  const session = favoriteSessionKey(auth.cookie)
+  // All parts belong to one video; merge repeated clicks on the same action.
+  return shareRequest(favoriteWriteRequests, JSON.stringify([session, bvid, Boolean(like)]), async () => {
+    const context = requireContext()
+    const deadline = Date.now() + PLAYBACK_LOAD_TIMEOUT_MS
+    const { cookie, profile } = await requireLoggedIn()
+    const writeSession = favoriteSessionKey(cookie)
+    const csrf = extractCookieValue(cookie, 'bili_jct')
+    if (!csrf) throw new Error('Bilibili 登录缺少收藏验证信息，请重新登录')
+    const { aid, folders } = await fetchVideoFavoriteFolders(bvid, cookie, profile, deadline)
+    const collectedIds = folders.filter((folder) => Number(folder.fav_state) === 1).map((folder) => String(folder.id))
+    let targetIds = collectedIds
+    if (like) {
+      const defaultFolder = folders.find(isDefaultFavorite) ?? folders[0]
+      if (!collectedIds.length && !defaultFolder) throw new Error('Bilibili 没有可用的收藏夹')
+      targetIds = collectedIds.length ? [] : [String(defaultFolder.id)]
+    }
+    if (targetIds.length) {
+      await biliJson('https://api.bilibili.com/x/v3/fav/resource/deal', {
+        cookie, deadline, method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          rid: String(aid), type: '2', csrf,
+          add_media_ids: like ? targetIds.join(',') : '',
+          del_media_ids: like ? '' : targetIds.join(',')
+        }).toString()
+      })
+    }
+    if (pluginContext !== context || favoriteSessionKey((await readAuth())?.cookie) !== writeSession) {
+      throw new Error('Bilibili 账号已切换，请刷新收藏夹')
+    }
+    favoriteMutationVersion++
+    favoriteTrackCache.clear()
+    favoritePageCache.clear()
+    favoriteTrackRequests.clear()
+    favoritePageRequests.clear()
+    favoriteStateRequests.clear()
+    favoriteLibraryRequests.clear()
+    favoriteVideoStates.set(favoriteVideoKey(writeSession, bvid), {
+      aid, liked: Boolean(like), expiresAt: Date.now() + FAVORITE_CACHE_TTL_MS
+    })
+  })
 }
 
 function favoriteSessionKey(cookie) {
@@ -552,7 +688,7 @@ async function getPlaybackUrl(track) {
     logWarn(`Bilibili DASH unavailable for ${ids.bvid}:${ids.cid}: ${errorToMessage(error)}`)
     // A stale cid from a cached library listing yields playurl -404; re-resolve
     // the cid from the live view API once before giving up.
-    refreshedCid = await refreshCidFromView(ids, cookie, deadline)
+    refreshedCid = track?.mediaPart ? null : await refreshCidFromView(ids, cookie, deadline)
     if (refreshedCid) {
       try {
         const audioSource = await fetchDashAudioSource(
@@ -640,6 +776,8 @@ async function refreshCidFromView(ids, cookie, deadline) {
   try {
     const view = await getVideoView(ids.bvid, cookie, { deadline }, 3000)
     const pages = Array.isArray(view?.pages) ? view.pages : []
+    // Never replace a selected part with the first part of a multi-part video.
+    if (pages.length > 1) return null
     const cid = Number(pages[0]?.cid ?? view?.cid)
     if (Number.isFinite(cid) && cid > 0 && cid !== Number(ids.cid)) return cid
     return null
@@ -658,26 +796,30 @@ async function mapMediaToTracks(media, albumName, cookie, deadline) {
   const bvid = typeof media.bvid === 'string' ? media.bvid : typeof media.bv_id === 'string' ? media.bv_id : ''
   if (!bvid) return []
   const directCid = extractMediaCid(media)
-  const view = directCid ? null : await getVideoView(bvid, cookie, { deadline, retries: 1 }).catch((error) => {
+  // first_cid identifies P1, not a single-part video. Only an explicit page
+  // count of one can safely avoid fetching the individual titles/durations.
+  const needsView = !directCid || Number(media.page) !== 1
+  const view = !needsView ? null : await getVideoView(bvid, cookie, { deadline, retries: 1 }).catch((error) => {
     if (!isTrackMissingError(error)) throw error
     logWarn(`Skipping Bilibili media ${bvid}: ${errorToMessage(error)}`)
     return null
   })
+  if (needsView && !view) return []
   const pages = Array.isArray(view?.pages) ? view.pages : []
   if (pages.length > 1) {
     const coverProxy = typeof media.cover === 'string' && media.cover
       ? await createImageProxyUrl(media.cover, cookie)
       : null
     return pages
-      .map((page) => {
-        const track = mapPageToTrack(media, { bvid, page, albumName })
+      .map((page, index) => {
+        const track = mapPageToTrack(media, { bvid, page, albumName, partIndex: index + 1, partCount: pages.length })
         if (track && coverProxy) track.cover = coverProxy
         return track
       })
       .filter(Boolean)
   }
   const page = pages[0] ?? null
-  const cid = directCid ?? Number(page?.cid ?? view?.cid)
+  const cid = Number(page?.cid ?? view?.cid ?? directCid)
   if (!Number.isFinite(cid) || cid <= 0) return []
   const track = mapBiliMediaToTrack(media, {
     bvid,
@@ -698,15 +840,23 @@ export function mapPageToTrack(media, options) {
   if (!Number.isFinite(cid) || cid <= 0) return null
   const partName = typeof options.page?.part === 'string' && options.page.part.trim()
     ? options.page.part
-    : `P${Number(options.page?.page) || 1}`
+    : `P${Number(options.page?.page) || options.partIndex || 1}`
   const baseTitle = String(media.title || 'Bilibili 视频')
-  return mapBiliMediaToTrack(media, {
+  const track = mapBiliMediaToTrack(media, {
     bvid,
     cid,
     title: `${baseTitle} - ${partName}`,
-    duration: Number(options.page?.duration) || Number(media.duration) || 0,
+    duration: Math.max(0, Number(options.page?.duration) || 0),
     albumName: options.albumName
   })
+  track.mediaPart = {
+    groupId: `bili:${bvid}`,
+    groupTitle: baseTitle,
+    title: partName,
+    index: Number(options.page?.page) || options.partIndex || 1,
+    count: options.partCount || 1
+  }
+  return track
 }
 
 async function mapSearchResultToTrack(item, cookie) {
@@ -776,7 +926,11 @@ export async function biliJson(input, options = {}, timeoutMs = BILI_REQUEST_TIM
     const remaining = options.deadline == null ? timeoutMs : Math.min(timeoutMs, options.deadline - Date.now())
     if (remaining <= 0) throw transientError('Bilibili 加载超时，请稍后重试')
     try {
-      return await fetchWithTimeout(input, { headers: defaultHeaders(options.cookie) }, remaining, async (response) => {
+      return await fetchWithTimeout(input, {
+        method: options.method,
+        body: options.body,
+        headers: { ...defaultHeaders(options.cookie), ...options.headers }
+      }, remaining, async (response) => {
         if (!response.ok) {
           const error = new Error(`Bilibili 请求失败：HTTP ${response.status}`)
           error.retryable = [408, 429].includes(response.status) || response.status >= 500
@@ -1313,7 +1467,7 @@ export function mapBiliMediaToTrack(media, options) {
     album: String(options.albumName || 'Bilibili'),
     filePath: id,
     fileName: `${artist} - ${title}`,
-    duration: Number(options.duration) || Number(media.duration) || 0,
+    duration: Math.max(0, Number(options.duration ?? media.duration) || 0),
     size: 0,
     cover: typeof media.cover === 'string' && media.cover ? normalizeImageUrl(media.cover) : null,
     lyrics: null,

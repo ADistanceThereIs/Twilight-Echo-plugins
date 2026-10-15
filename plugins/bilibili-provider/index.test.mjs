@@ -378,7 +378,7 @@ test('does not request profile details when the session is rejected', async (t) 
   assert.deepEqual(requests, ['/x/web-interface/nav'])
 })
 
-test('registers safe stubs for every capability-exposed provider method', async () => {
+test('registers safe read probes and rejects unavailable favorite writes', async () => {
   let registered = null
   const context = {
     logger: { info: () => undefined, warn: () => undefined },
@@ -395,7 +395,8 @@ test('registers safe stubs for every capability-exposed provider method', async 
   // The renderer probes these on every track switch; an unimplemented RPC is
   // counted as a plugin failure by the host circuit breaker.
   assert.equal(await registered.isTrackLiked('bili:x:1'), false)
-  assert.equal(await registered.likeTrack('bili:x:1', true), undefined)
+  await assert.rejects(registered.likeTrack('bili:x:1', true), /视频 ID 无效/)
+  await assert.rejects(registered.likeTrack('BV1:1', false), /请先登录/)
   assert.equal(await registered.followArtist('up-1', true), undefined)
   assert.equal(await registered.followUser('user-1', false), undefined)
   assert.equal(await registered.getQrImage('key'), null)

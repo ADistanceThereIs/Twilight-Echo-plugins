@@ -39,6 +39,11 @@ plugins/
     index.mjs
     index.test.mjs
     README.md
+  navidrome-provider/
+    plugin.json
+    index.mjs
+    index.test.mjs
+    README.md
   qqmusic-provider/
     plugin.json
     index.mjs
@@ -61,6 +66,7 @@ packages/
   com.twilightecho.provider.qqmusic-0.3.2.tep
   com.twilightecho.provider.kugou-0.2.3.tep
   com.twilightecho.provider.ytmusic-1.0.5.tep
+  com.twilightecho.provider.navidrome-1.0.0.tep
 catalog/                   # reviewed independent plugins, one JSON file per plugin
 community.json             # automatically discovered plugins and ID ownership history
 plugins.json
@@ -187,6 +193,16 @@ $env:TWILIGHT_ECHO_ROOT="D:\Twilight_Echo-Pxasen"
 pnpm run pack:qishui
 ```
 
+To package the Navidrome provider specifically:
+
+```powershell
+$env:TWILIGHT_ECHO_ROOT="D:\Project\Twilight_Echo"
+pnpm run pack:navidrome
+```
+
+This creates `packages/com.twilightecho.provider.navidrome-1.0.0.tep` and refreshes
+`plugins.json`.
+
 `pnpm run pack` creates or updates:
 
 - `packages/com.twilightecho.provider.bilibili-0.1.15.tep`
@@ -308,3 +324,7 @@ Apache-2.0. See [LICENSE](LICENSE).
 ### Jellyfin 音源
 
 `com.twilightecho.provider.jellyfin`：通过服务器地址、用户名和密码登录，支持音乐搜索、全部音乐、歌单、封面和音频播放。需使用包含服务器登录表单的宿主构建，参见 [插件说明](plugins/jellyfin-provider/README.md)。
+
+### Navidrome 音源
+
+`com.twilightecho.provider.navidrome`：使用 Subsonic / OpenSubsonic API 连接 Navidrome 服务器，支持服务器登录、歌曲和专辑搜索、歌单读取、播放、封面和同步歌词。通过插件市场或本地 `.tep` 安装并启用，需 Twilight Echo 1.3.0 或更新版本。参见 [插件说明](plugins/navidrome-provider/README.md)。

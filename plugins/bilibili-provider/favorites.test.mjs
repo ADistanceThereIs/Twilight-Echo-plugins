@@ -217,15 +217,174 @@ test("a late page response from before refresh cannot repopulate the new folder 
   assert.equal(secondPageCalls, 2);
 });
 
-const cookie = "SESSDATA=test-session; DedeUserID=42; buvid3=test-device";
+const cookie = "SESSDATA=test-session; DedeUserID=42; bili_jct=test-csrf; buvid3=test-device";
 const media = (id) => ({
+  id,
   bvid: `BV${id}`,
   type: 2,
   attr: 0,
   title: `Video ${id}`,
   duration: 60,
+  page: 1,
   ugc: { first_cid: id },
   upper: { name: "Creator" },
+});
+
+test("first_cid never hides multiple parts, including when the part count is unknown", async (t) => {
+  const { provider, calls } = await harness(t, (url) => {
+    if (url.pathname.endsWith('/resource/list')) {
+      const unknown = { ...media(2) };
+      delete unknown.page;
+      return json(page([{ ...media(1), page: 41, duration: 99999 }, unknown, media(3)]));
+    }
+    const id = Number(url.searchParams.get('bvid').slice(2));
+    return json({ code: 0, data: { pages: Array.from({ length: 41 }, (_, i) => ({
+      cid: id * 1000 + i, page: i + 1, part: `Movement ${i + 1}`, duration: i === 40 ? 0 : 120 + i
+    })) } });
+  });
+  const result = await provider.fetchPlaylistTracksPage('123');
+  assert.equal(result.tracks.length, 83);
+  assert.deepEqual(result.tracks[20].mediaPart, {
+    groupId: 'bili:BV1', groupTitle: 'Video 1', title: 'Movement 21', index: 21, count: 41
+  });
+  assert.equal(result.tracks[20].id, 'bili:BV1:1020');
+  assert.equal(result.tracks[20].duration, 140);
+  assert.equal(result.tracks[40].duration, 0, 'unknown duration must not inherit the whole video duration');
+  assert.equal(result.tracks.at(-1).mediaPart, undefined);
+  assert.equal(calls.filter(url => url.pathname.endsWith('/view')).length, 2);
+  await provider.fetchPlaylistTracksPage('123');
+  assert.equal(calls.filter(url => url.pathname.endsWith('/view')).length, 2, 'reopening uses the page cache');
+});
+
+test("favorites default to liked without a state RPC, and unfavorite removes the video from all collected folders", async (t) => {
+  let removed = false;
+  let writes = 0;
+  const { provider, calls } = await harness(t, (url, options) => {
+    if (url.pathname.endsWith('/resource/list')) return json(page(removed ? [] : [media(1)]));
+    if (url.pathname.endsWith('/created/list-all')) {
+      assert.equal(url.searchParams.get('rid'), '1');
+      return json({ code: 0, data: { list: [
+        { id: 123, attr: 0, fav_state: 1 },
+        { id: 456, attr: 2, fav_state: 1 },
+        { id: 789, attr: 2, fav_state: 0 }
+      ] } });
+    }
+    assert.equal(url.pathname, '/x/v3/fav/resource/deal');
+    assert.equal(options.method, 'POST');
+    assert.equal(options.headers['Content-Type'], 'application/x-www-form-urlencoded');
+    assert.equal(options.headers.Cookie, cookie);
+    assert.equal(options.headers.Referer, 'https://www.bilibili.com/');
+    const form = new URLSearchParams(options.body);
+    assert.equal(form.get('rid'), '1');
+    assert.equal(form.get('type'), '2');
+    assert.equal(form.get('csrf'), 'test-csrf');
+    assert.equal(form.get('add_media_ids'), '');
+    assert.equal(form.get('del_media_ids'), '123,456');
+    writes++;
+    removed = true;
+    return json({ code: 0 });
+  });
+  await provider.fetchPlaylistTracksPage('123');
+  await provider.fetchPlaylistTracks('123');
+  const reads = calls.length;
+  assert.equal(await provider.isTrackLiked('BV1:1'), true);
+  assert.equal(await provider.isTrackLiked('bili:BV1:99'), true);
+  assert.equal(calls.length, reads);
+  await Promise.all([provider.likeTrack('BV1:1', false), provider.likeTrack('BV1:99', false)]);
+  assert.equal(writes, 1);
+  assert.equal(await provider.isTrackLiked('BV1:99'), false);
+  assert.deepEqual((await provider.fetchPlaylistTracksPage('123')).tracks, []);
+  assert.deepEqual(await provider.fetchPlaylistTracks('123'), []);
+});
+
+test("search and restored queue favorites resolve avid and can be added to the default folder", async (t) => {
+  let liked = false;
+  const { provider } = await harness(t, (url, options) => {
+    if (url.pathname.endsWith('/view')) return json({ code: 0, data: { aid: 7 } });
+    if (url.pathname.endsWith('/created/list-all')) {
+      assert.equal(url.searchParams.get('rid'), '7');
+      return json({ code: 0, data: { list: [
+        { id: 456, attr: 2, fav_state: 0 },
+        { id: 123, attr: 0, fav_state: liked ? 1 : 0 }
+      ] } });
+    }
+    const form = new URLSearchParams(options.body);
+    assert.equal(form.get('add_media_ids'), '123');
+    assert.equal(form.get('del_media_ids'), '');
+    liked = true;
+    return json({ code: 0 });
+  });
+  assert.equal(await provider.isTrackLiked('BV7:1'), false);
+  await provider.likeTrack('BV7:2', true);
+  assert.equal(await provider.isTrackLiked('BV7:1'), true);
+});
+
+test("rejected and failed writes preserve favorite state and are never automatically retried", async (t) => {
+  let attempts = 0;
+  let networkFailure = false;
+  const { provider } = await harness(t, (url) => {
+    if (url.pathname.endsWith('/resource/list')) return json(page([media(1)]));
+    if (url.pathname.endsWith('/created/list-all')) return json({ code: 0, data: { list: [{ id: 123, fav_state: 1 }] } });
+    attempts++;
+    if (networkFailure) throw new TypeError('fetch failed');
+    return json({ code: -111, message: 'csrf校验失败' });
+  });
+  await provider.fetchPlaylistTracksPage('123');
+  await assert.rejects(provider.likeTrack('BV1:1', false), /-111/);
+  assert.equal(await provider.isTrackLiked('BV1:1'), true);
+  networkFailure = true;
+  await assert.rejects(provider.likeTrack('BV1:1', false), /fetch failed/);
+  assert.equal(attempts, 2);
+  assert.equal(await provider.isTrackLiked('BV1:1'), true);
+});
+
+test("missing csrf prevents a favorite write, and account switches cannot reuse favorite states", async (t) => {
+  const { provider, values, calls } = await harness(t, (url) => {
+    if (url.pathname.endsWith('/resource/list')) return json(page([media(1)]));
+    if (url.pathname.endsWith('/view')) return json({ code: 0, data: { aid: 1 } });
+    return json({ code: 0, data: { list: [{ id: 123, fav_state: 0 }] } });
+  });
+  await provider.fetchPlaylistTracksPage('123');
+  values.set('auth', { cookie: cookie.replace('bili_jct=test-csrf;', '') });
+  await assert.rejects(provider.likeTrack('BV1:1', false), /重新登录/);
+  assert.ok(!calls.some((url) => url.pathname.endsWith('/resource/deal')));
+  values.set('auth', { cookie: cookie.replace('test-session', 'other-session') });
+  assert.equal(await provider.isTrackLiked('BV1:1'), false);
+});
+
+test("incomplete folder favorite states cannot turn an unfavorite into a false success", async (t) => {
+  const { provider, calls } = await harness(t, (url) => {
+    if (url.pathname.endsWith('/resource/list')) return json(page([media(1)]));
+    return json({ code: 0, data: { list: [{ id: 123 }] } });
+  });
+  await provider.fetchPlaylistTracksPage('123');
+  await assert.rejects(provider.likeTrack('BV1:1', false), /收藏状态数据不完整/);
+  assert.equal(await provider.isTrackLiked('BV1:1'), true);
+  assert.ok(!calls.some((url) => url.pathname.endsWith('/resource/deal')));
+});
+
+test("late page and full-list reads cannot resurrect favorites after a successful unfavorite", async (t) => {
+  let removed = false;
+  const replies = [];
+  const { provider } = await harness(t, (url) => {
+    if (url.pathname.endsWith('/resource/list')) {
+      if (!removed && replies.length < 2) return new Promise((resolve) => replies.push(resolve));
+      return json(page([]));
+    }
+    if (url.pathname.endsWith('/view')) return json({ code: 0, data: { aid: 1 } });
+    if (url.pathname.endsWith('/created/list-all')) return json({ code: 0, data: { list: [{ id: 123, fav_state: 1 }] } });
+    removed = true;
+    return json({ code: 0 });
+  });
+  const stalePage = provider.fetchPlaylistTracksPage('123');
+  const staleList = provider.fetchPlaylistTracks('123');
+  while (replies.length < 2) await new Promise((resolve) => setImmediate(resolve));
+  await provider.likeTrack('BV1:1', false);
+  for (const reply of replies) reply(json(page([media(1)])));
+  await Promise.all([stalePage, staleList]);
+  assert.equal(await provider.isTrackLiked('BV1:1'), false);
+  assert.deepEqual((await provider.fetchPlaylistTracksPage('123')).tracks, []);
+  assert.deepEqual(await provider.fetchPlaylistTracks('123'), []);
 });
 const page = (medias, hasMore = false) => ({
   code: 0,
@@ -671,4 +830,23 @@ test("playback fallback chain stops before the host 30s RPC timeout", async (t) 
     /加载超时/,
   );
   assert.equal(playbackCalls, 1);
+});
+
+test("a missing selected part cannot fall back to P1, with or without grouping metadata", async (t) => {
+  const { provider, calls } = await harness(t, (url) => {
+    if (url.pathname.endsWith('/view')) return json({ code: 0, data: {
+      pages: [{ page: 1, cid: 101 }, { page: 2, cid: 202 }]
+    } });
+    assert.equal(url.pathname, '/x/player/wbi/playurl');
+    assert.equal(url.searchParams.get('cid'), '202');
+    return json({ code: -404, message: '啥都木有' });
+  }, () => json({ code: 0, data: { isLogin: true, mid: 42, wbi_img: {
+    img_url: 'https://bilibili.com/7cd084941338484aae1ad9425b84077c.png',
+    sub_url: 'https://bilibili.com/4932caff0ff746eab6f01bf08b70ac45.png'
+  } } }));
+  await assert.rejects(provider.getPlaybackUrl({ id: 'bili:BV1:202', mediaPart: { index: 2, count: 2 } }), /视频已失效/);
+  assert.equal(calls.filter(url => url.pathname.endsWith('/view')).length, 0);
+  await assert.rejects(provider.getPlaybackUrl({ id: 'bili:BV1:202' }), /视频已失效/);
+  assert.equal(calls.filter(url => url.pathname.endsWith('/view')).length, 1);
+  assert.equal(calls.filter(url => url.pathname.endsWith('/playurl')).length, 2);
 });
